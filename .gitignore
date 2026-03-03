@@ -14,3 +14,6 @@ wheels/
 
 # coding assistant files
 AGENTS.md
+
+# environment variables
+.env
