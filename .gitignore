@@ -17,3 +17,6 @@ AGENTS.md
 
 # environment variables
 .env
+
+# runtime database
+*.db
