@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import os
 
 import streamlit as st
 from agents import Runner
+from openai import OpenAI
 
 from agent import get_life_coach_agent, get_run_config, get_session
 
@@ -18,6 +20,9 @@ if "agent" not in st.session_state:
     st.session_state.agent = get_life_coach_agent()
 if "session" not in st.session_state:
     st.session_state.session = get_session(session_id="user_session_1")
+
+client = OpenAI()
+VECTOR_STORE_ID = os.environ["VECTOR_STORE_ID"]
 
 # ── Sidebar: Memory Viewer ──────────────────────────────────────────────────
 with st.sidebar:
@@ -53,10 +58,13 @@ with st.sidebar:
 
 # ── Status labels for raw OpenAI API event types ────────────────────────────
 STATUS_MESSAGES = {
-    "response.web_search_call.in_progress": ("🔍 Starting web search...", "running"),
-    "response.web_search_call.searching":   ("🔍 Searching the web...", "running"),
-    "response.web_search_call.completed":   ("✅ Web search complete", "complete"),
-    "response.completed":                   (" ", "complete"),
+    "response.web_search_call.in_progress":  ("🔍 Starting web search...", "running"),
+    "response.web_search_call.searching":    ("🔍 Searching the web...", "running"),
+    "response.web_search_call.completed":    ("✅ Web search complete", "complete"),
+    "response.file_search_call.in_progress": ("🗂️ Starting file search...", "running"),
+    "response.file_search_call.searching":   ("🗂️ File search in progress...", "running"),
+    "response.file_search_call.completed":   ("✅ File search complete", "complete"),
+    "response.completed":                    (" ", "complete"),
 }
 
 def update_status(status_container, event_type: str):
@@ -98,6 +106,9 @@ async def paint_history():
             if message["type"] == "web_search_call":
                 with st.chat_message("assistant"):
                     st.write("🔍 Searched the web")
+            elif message["type"] == "file_search_call":
+                with st.chat_message("assistant"):
+                    st.write("🗂️ Searched your files")
 
 asyncio.run(paint_history())
 
@@ -120,12 +131,32 @@ async def stream_agent(user_input: str, status_container):
                 yield event.data.delta.replace("$", "\\$")
 
 # ── Chat input ───────────────────────────────────────────────────────────────
-if prompt := st.chat_input("How can I help you today?"):
-    with st.chat_message("user"):
-        st.write(prompt)
+if prompt := st.chat_input(
+    "How can I help you today?",
+    accept_file=True,
+    file_type=["txt", "pdf"],
+):
+    # Handle file uploads first
+    for file in prompt.files:
+        if file.type.startswith("text/") or file.type == "application/pdf":
+            with st.chat_message("assistant"):
+                with st.status("⏳ Uploading file...") as status:
+                    uploaded_file = client.files.create(
+                        file=(file.name, file.getvalue()),
+                        purpose="user_data",
+                    )
+                    status.update(label="⏳ Attaching to vector store...")
+                    client.vector_stores.files.create(
+                        vector_store_id=VECTOR_STORE_ID,
+                        file_id=uploaded_file.id,
+                    )
+                    status.update(label="✅ File uploaded to your vault", state="complete")
 
-    with st.chat_message("assistant"):
-        status_container = st.status("⏳ Thinking...", expanded=False)
-        st.write_stream(stream_agent(prompt, status_container))
-
-    st.rerun()  # repaint history from DB and refresh sidebar memory count
+    # Handle text message
+    if prompt.text:
+        with st.chat_message("user"):
+            st.write(prompt.text)
+        with st.chat_message("assistant"):
+            status_container = st.status("⏳ Thinking...", expanded=False)
+            st.write_stream(stream_agent(prompt.text, status_container))
+        st.rerun()  # repaint history from DB and refresh sidebar memory count
