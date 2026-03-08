@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import logging
 import os
+import traceback
 
 import streamlit as st
 from agents import Runner
@@ -38,10 +40,25 @@ with st.sidebar:
     if memory_items:
         st.markdown(f"**{len(memory_items)} item(s) stored**")
         st.markdown("---")
+        TOOL_ICONS = {
+            "web_search_call":      "🔍 web_search_call",
+            "file_search_call":     "🗂️ file_search_call",
+            "image_generation_call": "🎨 image_generation_call",
+        }
         for i, item in enumerate(memory_items, 1):
-            role = item.get("role", "unknown") if isinstance(item, dict) else getattr(item, "role", "unknown")
-            role_icon = "🧑" if role == "user" else "🤖" if role == "assistant" else "⚙️"
-            with st.expander(f"{role_icon} [{i}] {role.capitalize()}", expanded=False):
+            if not isinstance(item, dict):
+                label = f"⚙️ [{i}] unknown"
+            elif "role" in item:
+                role = item["role"]
+                role_icon = "🧑" if role == "user" else "🤖"
+                label = f"{role_icon} [{i}] {role.capitalize()}"
+            elif "type" in item:
+                item_type = item["type"]
+                icon_label = TOOL_ICONS.get(item_type, f"⚙️ {item_type}")
+                label = f"{icon_label} [{i}]"
+            else:
+                label = f"⚙️ [{i}] unknown"
+            with st.expander(label, expanded=False):
                 st.json(item if isinstance(item, dict) else vars(item) if hasattr(item, "__dict__") else str(item))
     else:
         st.info("No memory yet. Start a conversation!")
@@ -58,13 +75,15 @@ with st.sidebar:
 
 # ── Status labels for raw OpenAI API event types ────────────────────────────
 STATUS_MESSAGES = {
-    "response.web_search_call.in_progress":  ("🔍 Starting web search...", "running"),
-    "response.web_search_call.searching":    ("🔍 Searching the web...", "running"),
-    "response.web_search_call.completed":    ("✅ Web search complete", "complete"),
-    "response.file_search_call.in_progress": ("🗂️ Starting file search...", "running"),
-    "response.file_search_call.searching":   ("🗂️ File search in progress...", "running"),
-    "response.file_search_call.completed":   ("✅ File search complete", "complete"),
-    "response.completed":                    (" ", "complete"),
+    "response.web_search_call.in_progress":       ("🔍 Starting web search...", "running"),
+    "response.web_search_call.searching":         ("🔍 Searching the web...", "running"),
+    "response.web_search_call.completed":         ("✅ Web search complete", "complete"),
+    "response.file_search_call.in_progress":      ("🗂️ Starting file search...", "running"),
+    "response.file_search_call.searching":        ("🗂️ File search in progress...", "running"),
+    "response.file_search_call.completed":        ("✅ File search complete", "complete"),
+    "response.image_generation_call.in_progress": ("🎨 Drawing image...", "running"),
+    "response.image_generation_call.generating":  ("🎨 Drawing image...", "running"),
+    "response.completed":                         (" ", "complete"),
 }
 
 def update_status(status_container, event_type: str):
@@ -109,11 +128,15 @@ async def paint_history():
             elif message["type"] == "file_search_call":
                 with st.chat_message("assistant"):
                     st.write("🗂️ Searched your files")
+            elif message["type"] == "image_generation_call":
+                image = base64.b64decode(message["result"])
+                with st.chat_message("assistant"):
+                    st.image(image)
 
 asyncio.run(paint_history())
 
-# ── Streaming generator ──────────────────────────────────────────────────────
-async def stream_agent(user_input: str, status_container):
+# ── Agent runner (handles text streaming + partial image rendering) ──────────
+async def run_agent_with_images(user_input: str, status_container, text_placeholder, image_placeholder):
     streamed_result = Runner.run_streamed(
         st.session_state.agent,
         input=user_input,
@@ -121,14 +144,20 @@ async def stream_agent(user_input: str, status_container):
         max_turns=10,
         run_config=get_run_config(),
     )
-
+    response = ""
     async for event in streamed_result.stream_events():
         if event.type == "raw_response_event":
-            # Update the status container with live phase information
             update_status(status_container, event.data.type)
-            # Yield only text output deltas — precise, no false positives
             if event.data.type == "response.output_text.delta":
-                yield event.data.delta.replace("$", "\\$")
+                response += event.data.delta
+                text_placeholder.write(response.replace("$", "\\$"))
+            elif event.data.type == "response.image_generation_call.partial_image":
+                image = base64.b64decode(event.data.partial_image_b64)
+                image_placeholder.image(image)
+            elif event.data.type == "response.completed":
+                # Clear placeholders — final render handled by paint_history() after st.rerun()
+                image_placeholder.empty()
+                text_placeholder.empty()
 
 # ── Chat input ───────────────────────────────────────────────────────────────
 if prompt := st.chat_input(
@@ -158,5 +187,16 @@ if prompt := st.chat_input(
             st.write(prompt.text)
         with st.chat_message("assistant"):
             status_container = st.status("⏳ Thinking...", expanded=False)
-            st.write_stream(stream_agent(prompt.text, status_container))
-        st.rerun()  # repaint history from DB and refresh sidebar memory count
+            text_placeholder = st.empty()
+            image_placeholder = st.empty()
+            try:
+                asyncio.run(run_agent_with_images(prompt.text, status_container, text_placeholder, image_placeholder))
+                st.rerun()  # repaint history from DB and refresh sidebar memory count
+            except Exception as e:
+                tb = traceback.format_exc()
+                status_container.update(label="❌ Error — expand for details", state="error")
+                with status_container:
+                    st.error(f"**{type(e).__name__}:** {e}")
+                    st.code(tb, language="python")
+                text_placeholder.empty()
+                logger.exception("Agent run failed: %s", e)
